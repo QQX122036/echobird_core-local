@@ -121,6 +121,23 @@ pub fn run(context: Context<tauri::Wry>, _tray_icon_bytes: &'static [u8]) {
             let store: Arc<dyn Store> =
                 storage::sqlite::SqliteStore::open(&db_path).expect("open sqlite store");
             storage::global::install(store);
+
+            // 1-second safety timer: if the frontend never
+            // calls appReady() (boot crash, blank screen, etc.)
+            // we show the main window anyway so the user is
+            // never staring at a missing dock icon. Mirrors
+            // the proprietary build's [Safety] behavior.
+            let app_handle = app.handle().clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                if let Some(w) = app_handle.get_webview_window("main") {
+                    if !w.is_visible().unwrap_or(false) {
+                        let _ = w.show();
+                        let _ = w.set_focus();
+                    }
+                }
+            });
+
             Ok(())
         })
         .build(context)

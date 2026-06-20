@@ -3,7 +3,7 @@
 //! handles a lot of these natively (window control, file dialog,
 //! shell.open), so the Rust side is mostly a thin shim.
 
-use tauri::command;
+use tauri::{command, Manager};
 
 use crate::commands::ipc;
 use crate::error::{CoreResult, Error};
@@ -23,8 +23,17 @@ pub fn save_settings(
 }
 
 #[command]
-pub fn app_ready() -> Result<(), String> {
-    ipc(Ok(()))
+pub fn app_ready(app: tauri::AppHandle) -> Result<(), String> {
+    // Show the main window. The frontend calls this after the
+    // first paint so the window appears with the real UI on
+    // screen (no white flash). The lib.rs setup hook also
+    // installs a 1-second safety timer that shows the window
+    // even if the frontend never reaches the first paint.
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+    Ok(())
 }
 
 #[command]
