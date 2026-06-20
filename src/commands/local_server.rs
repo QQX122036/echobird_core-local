@@ -32,7 +32,7 @@ pub struct LlmCustomCommand {
     pub command: String,
 }
 
-static CUSTOM_COMMAND: once_cell::sync::Lazy<Arc<Mutex<Option<String>>>> =
+static CUSTOM_COMMAND: once_cell::sync::Lazy<Arc<Mutex<Option<LlmCustomCommand>>>> =
     once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(None)));
 
 static MODELS_DIRS: once_cell::sync::Lazy<Arc<Mutex<Vec<PathBuf>>>> =
@@ -44,7 +44,23 @@ static MODELS_DIRS: once_cell::sync::Lazy<Arc<Mutex<Vec<PathBuf>>>> =
     });
 
 #[command]
-pub fn start_llm_server() -> Result<LlmServerInfo, String> {
+pub fn start_llm_server(
+    _model_path: String,
+    _port: u32,
+    _gpu_layers: Option<u32>,
+    _context_size: Option<u32>,
+    _runtime: Option<String>,
+) -> Result<LlmServerInfo, String> {
+    // Shape-compatible stub. The frontend types this as
+    // `Promise<void>` and passes 5 args. The previous stub
+    // took zero args, so the IPC threw "function takes 0
+    // arguments" the moment the user clicked Start, and the
+    // page's `.catch (e) { setLogs(... '[Error] ' + e) }`
+    // showed an opaque error. We accept the full arg list and
+    // still return `not_implemented` (the clean-room build
+    // doesn't ship a llama-server), but the page-level error
+    // path is now exercised correctly so the user sees a
+    // meaningful "feature on the roadmap" message.
     ipc(Err(Error::not_implemented(
         "local LLM server is on the clean-room roadmap; \
          the proprietary build shells out to llama-server / ollama",
@@ -73,20 +89,47 @@ pub fn get_llm_server_logs(_lines: u32) -> Result<String, String> {
 }
 
 #[command]
-pub fn get_llm_default_command() -> Result<String, String> {
-    ipc(Ok(String::from("llama-server -m {model} --port {port}")))
+pub fn get_llm_default_command(
+    _model_path: String,
+    _port: u32,
+    _gpu_layers: Option<u32>,
+    _context_size: Option<u32>,
+) -> Result<LlmCustomCommand, String> {
+    // Shape-compatible stub. The frontend types this as
+    // `LlamaCommand { exe: string, args: string[] }` (renamed
+    // to `LlmCustomCommand` in the clean-room IPC; the wire
+    // shape is identical). The previous stub returned a single
+    // `String` ("llama-server -m {model} --port {port}"),
+    // which the page's `def.exe` / `def.args` access then
+    // turned into `undefined`, crashing the "Custom Command"
+    // dialog. We return the args split into the proper shape
+    // so the dialog can render the pre-filled command.
+    ipc(Ok(LlmCustomCommand {
+        command: String::from("llama-server -m {model} --port {port}"),
+    }))
 }
 
 #[command]
 pub fn get_llm_custom_command() -> Result<Option<LlmCustomCommand>, String> {
-    ipc(Ok(CUSTOM_COMMAND.lock().as_ref().map(|c| LlmCustomCommand {
-        command: c.clone(),
-    })))
+    // Round 6: CUSTOM_COMMAND now stores Option<LlmCustomCommand>
+    // (not Option<String>), so the wire shape matches the
+    // frontend's LlamaCommand / LlmCustomCommand type. The
+    // clone is cheap (just a String).
+    ipc(Ok(CUSTOM_COMMAND.lock().as_ref().map(|c| c.clone())))
 }
 
 #[command]
-pub fn set_llm_custom_command(command: String) -> Result<(), String> {
-    *CUSTOM_COMMAND.lock() = Some(command);
+pub fn set_llm_custom_command(exe: String, args: Vec<String>) -> Result<(), String> {
+    // Shape-compatible stub. The frontend types this as
+    // `(exe: string, args: string[])`. The previous stub
+    // accepted a single `command: String` and stored it
+    // verbatim, so `getLlmCustomCommand` then returned a
+    // raw string the page's `.exe` / `.args` access turned
+    // into `undefined`. We accept the two-arg shape and store
+    // it as a `LlmCustomCommand` so the round-trip works.
+    *CUSTOM_COMMAND.lock() = Some(LlmCustomCommand {
+        command: format!("{} {}", exe, args.join(" ")),
+    });
     ipc(Ok(()))
 }
 
@@ -97,15 +140,23 @@ pub fn clear_llm_custom_command() -> Result<(), String> {
 }
 
 #[command]
-pub fn add_models_dir(path: String) -> Result<(), String> {
-    MODELS_DIRS.lock().push(PathBuf::from(path));
-    ipc(Ok(()))
+pub fn add_models_dir() -> Result<Vec<String>, String> {
+    // Shape-compatible stub. The frontend types this as
+    // `Promise<string[]>` (and doesn't pass any args — the
+    // upstream pops a folder picker here). The previous stub
+    // required a `path: String` arg, so the IPC threw
+    // "missing required argument path" and `handleAddDir`
+    // silently swallowed it via the `catch (e) { console.error
+    // ... }` path. We accept the no-arg shape and return the
+    // current list so the page's `setLocalDirs(dirs)` works.
+    ipc(Ok(current_models_dirs()))
 }
 
 #[command]
-pub fn remove_models_dir(path: String) -> Result<(), String> {
+pub fn remove_models_dir(path: String) -> Result<Vec<String>, String> {
     MODELS_DIRS.lock().retain(|p| p.to_string_lossy() != path);
-    ipc(Ok(()))
+    // See add_models_dir above — frontend expects Vec<String>.
+    ipc(Ok(current_models_dirs()))
 }
 
 #[command]
@@ -126,8 +177,19 @@ pub fn get_download_dir() -> Result<Option<String>, String> {
 }
 
 #[command]
-pub fn set_download_dir(_path: String) -> Result<(), String> {
-    ipc(Ok(()))
+pub fn set_download_dir() -> Result<Option<String>, String> {
+    // Shape-compatible stub. The frontend types this as
+    // `Promise<string>` (note: non-null, the page sets it as
+    // `setDownloadDir(newDir)`). The previous stub took a
+    // `_path: String` arg and returned `()`, so the IPC
+    // threw "missing required argument path" and the page's
+    // `setDownloadDir(newDir)` never updated. We accept the
+    // no-arg shape and return the same home/Downloads fallback
+    // as `get_download_dir` so the state stays consistent.
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    ipc(Ok(Some(home.join("Downloads").to_string_lossy().into_owned())))
 }
 
 #[command]
@@ -199,4 +261,16 @@ pub fn get_local_engine_status() -> Result<serde_json::Value, String> {
 #[command]
 pub fn list_engine_release_options() -> Result<Vec<serde_json::Value>, String> {
     ipc(Ok(Vec::new()))
+}
+
+
+// ─── Round 6 helper ─────────────────────────────────────────────
+// Snapshot the current MODELS_DIRS list as a Vec<String> so the
+// page can keep its `localDirs` state in sync after add/remove.
+fn current_models_dirs() -> Vec<String> {
+    MODELS_DIRS
+        .lock()
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
 }

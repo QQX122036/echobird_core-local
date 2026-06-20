@@ -27,13 +27,22 @@ pub async fn parasite_send_message(
 }
 
 #[command]
-pub fn parasite_reset() -> Result<(), String> {
+pub fn parasite_reset(_agent_id: String) -> Result<(), String> {
+    // Shape-compatible stub — see parasite_abort.
     ipc(Ok(()))
 }
 
 #[command]
-pub fn parasite_abort() -> Result<(), String> {
-    ipc(Ok(()))
+pub fn parasite_abort(_agent_id: String) -> Result<bool, String> {
+    // Shape-compatible stub. The frontend types this as
+    // `Promise<boolean>` and passes `agentId`. The
+    // previous stub took zero args and returned `()`, so
+    // the IPC threw "unexpected argument agentId" and the
+    // page's `.then((ok) => ...)` got `undefined`. Now we
+    // accept the agentId and return `false` ("no active
+    // send to abort" — the clean-room build never started
+    // one).
+    ipc(Ok(false))
 }
 
 #[command]

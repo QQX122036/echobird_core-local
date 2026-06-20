@@ -161,12 +161,32 @@ fn read_tail(lines: u32) -> CoreResult<String> {
 }
 
 fn sysinfo() -> serde_json::Value {
-    // sysinfo read goes here; we just return the OS/arch pair
-    // because the upstream feeds the frontend a richer struct
-    // that we don't depend on.
+    // Round 6: the frontend typed this as
+    //   `SystemInfo { os, arch, hasNvidiaGpu, hasAmdGpu?,
+    //                   gpuName, gpuVramGb }`
+    // but the previous stub only returned `{os, arch}`. The
+    // page's `hasNvidiaGpu` / `os === 'linux'` /
+    // `os === 'macos'` logic silently got `undefined` /
+    // `false`, breaking the runtime-options panel on the
+    // LocalServer page (vLLM / SGLang only render on
+    // Linux + GPU, and that check collapsed to false on
+    // every host). We now return all 6 fields. The clean-room
+    // build can't actually probe the GPU (that's
+    // `detect_gpu`'s job); we leave the GPU fields as
+    // `null` / `false` so the page falls through to its
+    // own auto-probe / Metal-default branches.
     serde_json::json!({
-        "os": std::env::consts::OS,
+        "os": match std::env::consts::OS {
+            "macos" => "macos",
+            "linux" => "linux",
+            "windows" => "windows",
+            other => other,
+        },
         "arch": std::env::consts::ARCH,
+        "hasNvidiaGpu": false,
+        "hasAmdGpu": false,
+        "gpuName": null,
+        "gpuVramGb": null,
     })
 }
 

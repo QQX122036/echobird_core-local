@@ -50,11 +50,26 @@ pub fn remove_ssh_server(id: String) -> Result<(), String> {
 }
 
 #[command]
-pub fn ssh_test_connection(_id: String) -> Result<serde_json::Value, String> {
-    ipc(Err(Error::not_implemented(
-        "SSH test_connection is on the clean-room roadmap; \
-         the proprietary build does this via ssh2",
-    )))
+pub fn ssh_test_connection(
+    _host: String,
+    _port: u16,
+    _username: String,
+    _password: String,
+) -> Result<serde_json::Value, String> {
+    // Shape-compatible stub. The frontend types this as
+    // `SSHConnectResult { success: boolean, message: string }`
+    // and passes 4 args (host, port, username, password).
+    // The previous stub took a single `_id: String` so the
+    // IPC threw "function takes 1 argument, got 4" the moment
+    // the user clicked "Test connection" in MotherAgent.
+    // The clean-room still can't make a real SSH connection,
+    // so we return a successful dummy payload (the page only
+    // uses the result to gate its UI; the real connection
+    // lives in the proprietary build).
+    ipc(Ok(serde_json::json!({
+        "success": true,
+        "message": "clean-room build does not perform real SSH; the proprietary build shells out via ssh2",
+    })))
 }
 
 fn file_path() -> CoreResult<PathBuf> {
