@@ -257,10 +257,10 @@ fn split_sse_event(buffer: &str) -> Option<(String, String)> {
 }
 
 /// Parse one SSE event's payload (the lines after `data: `)
-/// into an `AgentEvent`. OpenAI and Anthropic shapes differ in
-/// their JSON envelopes; we normalize the delta-text extraction
-/// here.
-fn parse_sse_payload(raw: &str, _anthropic: bool) -> Option<AgentEvent> {
+/// into an `AgentEvent`. The `anthropic` flag dispatches to
+/// the right shape matcher. Both matchers share the
+/// `[DONE]`/`message_stop`/`response.done` terminal check.
+fn parse_sse_payload(raw: &str, anthropic: bool) -> Option<AgentEvent> {
     let data: String = raw
         .lines()
         .filter_map(|l| l.strip_prefix("data: "))
@@ -273,19 +273,49 @@ fn parse_sse_payload(raw: &str, _anthropic: bool) -> Option<AgentEvent> {
         return Some(AgentEvent::Done);
     }
     let v: serde_json::Value = serde_json::from_str(&data).ok()?;
-    // OpenAI Chat Completions: choices[0].delta.content
+    if anthropic {
+        parse_anthropic_sse(&v)
+    } else {
+        parse_openai_sse(&v)
+    }
+}
+
+/// OpenAI-shape parser. Handles both Chat Completions
+/// (`choices[0].delta.content`) and the Responses API
+/// (top-level `delta: "..."` string + `response.done`).
+fn parse_openai_sse(v: &serde_json::Value) -> Option<AgentEvent> {
+    // Chat Completions: choices[0].delta.content (string or null)
     if let Some(s) = v.pointer("/choices/0/delta/content").and_then(|x| x.as_str()) {
         return Some(AgentEvent::TextDelta { text: s.to_string() });
     }
-    // OpenAI Responses API: output_text.delta
+    // Responses API: top-level `delta` is a string when it's a
+    // text delta. (For tool-call deltas it's an object, which
+    // `as_str()` rejects and we fall through to `None` — we
+    // don't yet surface Responses-API tool calls, but we also
+    // don't misread them as text.)
     if let Some(s) = v.get("delta").and_then(|x| x.as_str()) {
         return Some(AgentEvent::TextDelta { text: s.to_string() });
     }
-    // Anthropic content_block_delta with delta.text
+    // Responses API done marker
+    if v.get("type").and_then(|t| t.as_str()) == Some("response.done") {
+        return Some(AgentEvent::Done);
+    }
+    // Chat Completions done marker
+    if v.get("type").and_then(|t| t.as_str()) == Some("message_stop") {
+        return Some(AgentEvent::Done);
+    }
+    None
+}
+
+/// Anthropic Messages API parser. Handles content_block_delta
+/// (text + tool-use input_json_delta), content_block_start
+/// (tool_use), and the message_stop terminal.
+fn parse_anthropic_sse(v: &serde_json::Value) -> Option<AgentEvent> {
+    // content_block_delta with delta.text
     if let Some(s) = v.pointer("/delta/text").and_then(|x| x.as_str()) {
         return Some(AgentEvent::TextDelta { text: s.to_string() });
     }
-    // Anthropic content_block_start with a tool_use block
+    // content_block_start with a tool_use block
     if let (Some(name), Some(id)) = (
         v.pointer("/content_block/name").and_then(|x| x.as_str()),
         v.pointer("/content_block/id").and_then(|x| x.as_str()),
@@ -295,21 +325,20 @@ fn parse_sse_payload(raw: &str, _anthropic: bool) -> Option<AgentEvent> {
             name: name.to_string(),
         });
     }
-    // Anthropic input_json_delta
-    if let (Some(id), Some(partial)) = (
-        v.pointer("/index").and_then(|x| x.as_u64()),
+    // input_json_delta: streams the tool-call args. `index`
+    // identifies which tool-use block is being streamed.
+    if let (Some(index), Some(partial)) = (
+        v.get("index").and_then(|x| x.as_u64()),
         v.pointer("/delta/partial_json").and_then(|x| x.as_str()),
     ) {
         return Some(AgentEvent::ToolCallArgs {
-            id: id.to_string(),
+            id: index.to_string(),
             args: partial.to_string(),
         });
     }
-    // message_stop / response.done
-    if let Some(t) = v.get("type").and_then(|t| t.as_str()) {
-        if t == "message_stop" || t == "response.done" {
-            return Some(AgentEvent::Done);
-        }
+    // message_stop
+    if v.get("type").and_then(|t| t.as_str()) == Some("message_stop") {
+        return Some(AgentEvent::Done);
     }
     None
 }
@@ -418,5 +447,72 @@ mod tests {
         ];
         assert_eq!(trim_to_input_cap(&mut messages, Some(10_000)), 0);
         assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn sse_openai_chat_done() {
+        // Chat Completions: type=message_stop is the terminal.
+        let raw = r#"data: {"type":"message_stop"}"#;
+        let ev = parse_sse_payload(raw, false).unwrap();
+        assert!(matches!(ev, AgentEvent::Done));
+    }
+
+    #[test]
+    fn sse_openai_empty_delta_falls_through() {
+        // Chat Completions heartbeat: choices[0].delta is an
+        // object with no content key. The parser must NOT
+        // emit an empty text_delta and must NOT crash.
+        let raw = r#"data: {"choices":[{"delta":{}}]}"#;
+        assert!(parse_sse_payload(raw, false).is_none());
+    }
+
+    #[test]
+    fn sse_anthropic_tool_use_start() {
+        let raw = r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_abc","name":"get_weather"}}"#;
+        let ev = parse_sse_payload(raw, true).unwrap();
+        match ev {
+            AgentEvent::ToolCallStart { id, name } => {
+                assert_eq!(id, "toolu_abc");
+                assert_eq!(name, "get_weather");
+            }
+            _ => panic!("wrong event"),
+        }
+    }
+
+    #[test]
+    fn sse_anthropic_input_json_delta() {
+        let raw = r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"SF\"}"}}"#;
+        let ev = parse_sse_payload(raw, true).unwrap();
+        match ev {
+            AgentEvent::ToolCallArgs { id, args } => {
+                assert_eq!(id, "1");
+                assert!(args.contains("SF"));
+            }
+            _ => panic!("wrong event"),
+        }
+    }
+
+    #[test]
+    fn sse_anthropic_message_stop() {
+        let raw = r#"data: {"type":"message_stop"}"#;
+        let ev = parse_sse_payload(raw, true).unwrap();
+        assert!(matches!(ev, AgentEvent::Done));
+    }
+
+    #[test]
+    fn sse_dispatch_isolates_anthropic_from_openai() {
+        // An Anthropic event must NOT be misread by the OpenAI
+        // parser (and vice versa) now that parse_sse_payload
+        // dispatches on the protocol flag.
+        let anthropic_event = r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#;
+        // If we lie and call the Anthropic-shaped event with
+        // anthropic=false, we should get None — the OpenAI
+        // parser doesn't know about /delta/text.
+        assert!(parse_sse_payload(anthropic_event, false).is_none());
+
+        let openai_event = r#"data: {"type":"response.output_text.delta","delta":"hi"}"#;
+        // And the OpenAI Responses delta must NOT be misread
+        // by the Anthropic parser.
+        assert!(parse_sse_payload(openai_event, true).is_none());
     }
 }
