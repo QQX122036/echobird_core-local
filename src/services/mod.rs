@@ -22,3 +22,4 @@ pub mod context_window;
 pub mod model_proxy;
 pub mod settings;
 pub mod tool_installer;
+pub mod pulse_archive;

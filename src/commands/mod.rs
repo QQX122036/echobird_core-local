@@ -17,6 +17,7 @@ pub mod bundled;
 pub mod local_server;
 pub mod models;
 pub mod parasite;
+pub mod pulse;
 pub mod secret;
 pub mod ssh;
 pub mod tools;
