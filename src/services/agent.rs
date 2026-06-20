@@ -5,19 +5,28 @@
 //! events to the frontend (see `src/api/types.ts`'s
 //! `AgentEvent`). This module is the Rust side of that pipeline.
 //!
-//! Token-limit integration:
-//!   * On entry, the user's `max_input_tokens` cap is applied to
-//!     the message history via `context_window::trim_to_input_cap`.
-//!   * On every upstream call, the per-request `max_tokens` is
-//!     clamped via `context_window::clamp_max_tokens` to
-//!     `max_output_tokens`.
-//!   * On done, we emit a `state` event with a `contextUsage`
-//!     payload the Mother Agent UI consumes for the progress bar.
+//! Token-limit integration (v5.3.4):
+//!   * Per-request `max_tokens` is clamped via
+//!     [`context_window::clamp_max_tokens`] to the user-configured
+//!     `max_output_tokens`. This is the headline behavior the
+//!     user sees when they save 32K output on a 1M-context model:
+//!     the upstream never gets asked to generate more than 32K
+//!     tokens per turn, no matter what the caller asked for.
+//!   * If the IPC sends a `history` array, the message list is
+//!     trimmed to fit `max_input_tokens` via
+//!     [`context_window::trim_to_input_cap`]. Older non-system
+//!     messages are dropped first, with a 5% safety margin so
+//!     the upstream doesn't 400 on a tight estimate.
+//!   * A `state` event with `{ kind: "contextUsage", usedTokens,
+//!     totalTokens }` is emitted before the upstream call, so
+//!     the Mother Agent UI can show a real percentage against
+//!     `max_context_tokens` instead of a hardcoded 128K/200K
+//!     denominator.
 //!
-//! Streaming is real: we use `reqwest`'s response stream and emit
-//! one `text_delta` per Server-Sent Event (SSE) chunk. Anthropic
-//! and OpenAI both speak SSE with slightly different envelope
-//! shapes; the parser handles both.
+//! Streaming is real: we use `reqwest`'s response stream and
+//! emit one `text_delta` per Server-Sent Event (SSE) chunk.
+//! Anthropic and OpenAI both speak SSE with slightly different
+//! envelope shapes; the parser handles both.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +42,19 @@ use super::context_window::{
 use super::models::ModelDto;
 use crate::error::{CoreResult, Error};
 use crate::storage::Store;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryMessage {
+    pub role: String,
+    pub content: String,
+}
+
+impl AsRef<str> for HistoryMessage {
+    fn as_ref(&self) -> &str {
+        self.content.as_str()
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +73,13 @@ pub struct AgentSendInput {
     pub skills: Vec<String>,
     #[serde(default)]
     pub locale: Option<String>,
+    /// Optional conversation history. When present, `trim_to_input_cap`
+    /// walks the full list (oldest non-system message first) until
+    /// the running estimate fits under the model’s
+    /// `max_input_tokens`. The first entry is treated as the
+    /// system prompt and is never evicted.
+    #[serde(default)]
+    pub history: Vec<HistoryMessage>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -67,72 +96,90 @@ pub enum AgentEvent {
 }
 
 /// Streaming chat-completion forward. Emits events to the
-/// frontend via Tauri events on the `agent-event` channel. Returns
-/// the final event for logging; callers (`commands::agent`) don't
-/// usually inspect it because the IPC contract is "fire and
-/// stream".
+/// frontend via Tauri events on the `agent-event` channel.
+/// Returns the final event for logging; the IPC contract is
+/// "fire and stream" so callers (`commands::agent`) don't
+/// usually inspect the return value.
 pub async fn send_message<R: Runtime>(
     app: &AppHandle<R>,
     store: &Arc<dyn Store>,
     input: AgentSendInput,
 ) -> CoreResult<AgentEvent> {
-    // The IPC sends `modelId` and `baseUrl` directly (not a
-    // `Model` lookup), so we don't pull the model out of the
-    // store — the user can paste a baseUrl that isn't in any
-    // saved model. Token limits therefore arrive as part of the
-    // saved model; if the user is chatting with an ad-hoc
-    // baseUrl, we just skip the cap (and the UI shows a hint).
-    //
-    // Resolve the saved model (if any) for its token caps.
+    // Resolve the saved model (if any) for its token caps. If
+    // the caller passed an ad-hoc baseUrl that doesn't match a
+    // saved model, we skip the cap and the UI shows a hint.
     let saved_model = lookup_saved_model(store, &input.model_id);
     let (max_input, max_output, max_context) = match &saved_model {
         Some(m) => (m.max_input_tokens, m.max_output_tokens, m.max_context_tokens),
         None => (None, None, None),
     };
 
-    // Compose the message list. Today the IPC sends a single
-    // user message; we wrap it in a 1-element vec to leave room
-    // for future multi-turn support. The trim step is a no-op
-    // for 1 message, but the cap is still applied to
-    // `max_tokens` on the request side.
-    let mut messages = vec![input.message.clone()];
-    let _dropped = trim_to_input_cap(&mut messages, max_input);
-    let _input_tokens = estimate_messages_tokens(&messages);
+    // Build the message list we'll actually send upstream. The
+    // history (if any) comes first; the current user message
+    // is appended at the end. The first history entry is
+    // treated as a system prompt and is not evictable — the
+    // trim helper preserves it by contract.
+    let mut messages: Vec<HistoryMessage> = input.history.clone();
+    messages.push(HistoryMessage {
+        role: "user".to_string(),
+        content: input.message.clone(),
+    });
 
-    // Choose protocol by URL pattern: an `anthropicUrl` set
-    // means the user wants the Anthropic protocol (the public
-    // `agent` service tries Anthropic first and falls back to
-    // OpenAI on 400). For the clean-room impl, we just look at
-    // the URL and dispatch.
+    // Apply the input cap. The trim keeps index 0 (system) and
+    // drops oldest non-system messages until the running
+    // estimate fits under the cap with 5% safety.
+    let dropped = trim_to_input_cap(&mut messages, max_input);
+    if dropped > 0 {
+        log::info!(
+            "agent: trimmed {dropped} oldest non-system message(s) to fit \
+             max_input_tokens={}",
+            max_input.unwrap_or(0)
+        );
+    }
+    let used_tokens = estimate_messages_tokens(&messages);
+
+    // Choose protocol by URL pattern. The public agent tries
+    // Anthropic first and falls back to OpenAI on 400; the
+    // clean-room build dispatches on the URL alone and never
+    // mid-flight switches (matches v5.2.0+ behavior).
     let use_anthropic = input
         .anthropic_url
         .as_deref()
         .map(|u| u.contains("anthropic") || u.contains("/v1/messages"))
         .unwrap_or(false);
     let url = if use_anthropic {
-        input.anthropic_url.clone().unwrap_or(input.base_url.clone())
+        input
+            .anthropic_url
+            .clone()
+            .unwrap_or_else(|| input.base_url.clone())
     } else {
         input.base_url.clone()
     };
 
-    // Build the request body, applying the output cap.
-    let requested_max_tokens = 4096u32; // Frontend's default for first call
+    // Clamp the per-request `max_tokens` to the configured
+    // `max_output_tokens`. The default 4096 is what the
+    // upstream's own SDK sends when the caller omits the field;
+    // we always send an explicit value so the cap is
+    // unambiguous.
+    let requested_max_tokens = 4096u32;
     let max_tokens = clamp_max_tokens(Some(requested_max_tokens), max_output);
-    let body = if use_anthropic {
-        json!({
-            "model": input.model_id,
-            "messages": [{"role": "user", "content": messages[0]}],
-            "max_tokens": max_tokens,
-            "stream": true,
-        })
-    } else {
-        json!({
-            "model": input.model_id,
-            "messages": [{"role": "user", "content": messages[0]}],
-            "max_tokens": max_tokens,
-            "stream": true,
-        })
-    };
+
+    // Build the OpenAI-shaped messages array from the
+    // *trimmed* message list so the upstream actually sees
+    // the result of `trim_to_input_cap`. This is the array the
+    // upstream will be billed against and the array that
+    // counts toward `max_input_tokens`.
+    let openai_messages: Vec<serde_json::Value> = messages
+        .iter()
+        .map(|m| json!({"role": m.role, "content": m.content}))
+        .collect();
+
+    let body = json!({
+        "model": input.model_id,
+        "messages": openai_messages,
+        "max_tokens": max_tokens,
+        "stream": true,
+    });
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
@@ -148,16 +195,15 @@ pub async fn send_message<R: Runtime>(
         return Err(Error::upstream(msg));
     }
 
-    // Emit a state event so the Mother Agent's progress bar can
-    // update. We send the post-trim token estimate + the
-    // configured context cap as the denominator.
+    // Emit the post-trim context-usage state event so the
+    // Mother Agent progress bar can update against the real cap.
     if let Some(ctx) = max_context {
         let _ = app.emit(
             "agent-event",
             AgentEvent::State {
                 state: json!({
                     "kind": "contextUsage",
-                    "usedTokens": _input_tokens,
+                    "usedTokens": used_tokens,
                     "totalTokens": ctx,
                 })
                 .to_string(),
@@ -187,9 +233,6 @@ pub async fn send_message<R: Runtime>(
 }
 
 fn lookup_saved_model(store: &Arc<dyn Store>, model_id: &str) -> Option<ModelDto> {
-    // Best-effort: try the lookup, swallow NotFound. Other
-    // errors (Storage, etc.) are logged via the IPC layer's
-    // error event.
     match store.get_model(model_id) {
         Ok(m) => Some(super::models::ModelDto::from(m)),
         Err(Error::NotFound { .. }) => None,
@@ -204,8 +247,6 @@ fn lookup_saved_model(store: &Arc<dyn Store>, model_id: &str) -> Option<ModelDto
 /// returned tuple is `(event_text, remainder)`. Returns `None`
 /// when the buffer doesn't yet contain a complete event.
 fn split_sse_event(buffer: &str) -> Option<(String, String)> {
-    // We split on \n\n (with optional leading \r) to find event
-    // boundaries. A trailing partial event is left in the buffer.
     let idx = buffer.find("\n\n").or_else(|| buffer.find("\r\n\r\n"))?;
     let (event, rest) = buffer.split_at(idx);
     let rest = rest
@@ -215,11 +256,11 @@ fn split_sse_event(buffer: &str) -> Option<(String, String)> {
     Some((event.to_string(), rest))
 }
 
-/// Parse one SSE event's payload (the lines after `data: `) into
-/// an `AgentEvent`. The OpenAI and Anthropic shapes differ in
-/// their JSON; we normalize the delta-text extraction here.
+/// Parse one SSE event's payload (the lines after `data: `)
+/// into an `AgentEvent`. OpenAI and Anthropic shapes differ in
+/// their JSON envelopes; we normalize the delta-text extraction
+/// here.
 fn parse_sse_payload(raw: &str, _anthropic: bool) -> Option<AgentEvent> {
-    // Concatenate the data lines, ignore everything else.
     let data: String = raw
         .lines()
         .filter_map(|l| l.strip_prefix("data: "))
@@ -232,11 +273,15 @@ fn parse_sse_payload(raw: &str, _anthropic: bool) -> Option<AgentEvent> {
         return Some(AgentEvent::Done);
     }
     let v: serde_json::Value = serde_json::from_str(&data).ok()?;
-    // OpenAI: choices[0].delta.content
+    // OpenAI Chat Completions: choices[0].delta.content
     if let Some(s) = v.pointer("/choices/0/delta/content").and_then(|x| x.as_str()) {
         return Some(AgentEvent::TextDelta { text: s.to_string() });
     }
-    // Anthropic: content_block_delta with delta.text
+    // OpenAI Responses API: output_text.delta
+    if let Some(s) = v.get("delta").and_then(|x| x.as_str()) {
+        return Some(AgentEvent::TextDelta { text: s.to_string() });
+    }
+    // Anthropic content_block_delta with delta.text
     if let Some(s) = v.pointer("/delta/text").and_then(|x| x.as_str()) {
         return Some(AgentEvent::TextDelta { text: s.to_string() });
     }
@@ -260,9 +305,11 @@ fn parse_sse_payload(raw: &str, _anthropic: bool) -> Option<AgentEvent> {
             args: partial.to_string(),
         });
     }
-    // message_stop
-    if v.get("type").and_then(|t| t.as_str()) == Some("message_stop") {
-        return Some(AgentEvent::Done);
+    // message_stop / response.done
+    if let Some(t) = v.get("type").and_then(|t| t.as_str()) {
+        if t == "message_stop" || t == "response.done" {
+            return Some(AgentEvent::Done);
+        }
     }
     None
 }
@@ -316,5 +363,60 @@ mod tests {
         let raw = "data: [DONE]";
         let ev = parse_sse_payload(raw, false).unwrap();
         assert!(matches!(ev, AgentEvent::Done));
+    }
+
+    #[test]
+    fn sse_responses_delta() {
+        // OpenAI Responses API: {type: "response.output_text.delta", delta: "..."}
+        let raw =
+            r#"data: {"type":"response.output_text.delta","delta":"world"}"#;
+        let ev = parse_sse_payload(raw, false).unwrap();
+        match ev {
+            AgentEvent::TextDelta { text } => assert_eq!(text, "world"),
+            _ => panic!("wrong event"),
+        }
+    }
+
+    #[test]
+    fn trim_keeps_system_and_user_message() {
+        // Reproduce the message-list construction path that
+        // `send_message` uses: history + current user message,
+        // trimmed to `max_input_tokens`. The system prompt
+        // (index 0) must survive; the current user message
+        // (last) must survive; oldest middle messages are
+        // dropped.
+        let mut messages: Vec<HistoryMessage> = vec![
+            HistoryMessage { role: "system".into(), content: "you are helpful".into() },
+            HistoryMessage { role: "user".into(), content: "old-1".into() },
+            HistoryMessage { role: "assistant".into(), content: "old-1-reply".into() },
+            HistoryMessage { role: "user".into(), content: "old-2".into() },
+            HistoryMessage { role: "assistant".into(), content: "old-2-reply".into() },
+            HistoryMessage { role: "user".into(), content: "current question".into() },
+        ];
+        let dropped = trim_to_input_cap(&mut messages, Some(20));
+        assert!(dropped > 0);
+        // System + current question both survive.
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages.last().unwrap().content, "current question");
+        assert_eq!(messages.last().unwrap().role, "user");
+    }
+
+    #[test]
+    fn trim_skipped_when_cap_none_or_under() {
+        // No cap: no trim.
+        let mut messages: Vec<HistoryMessage> = vec![
+            HistoryMessage { role: "system".into(), content: "sys".into() },
+            HistoryMessage { role: "user".into(), content: "hi".into() },
+        ];
+        assert_eq!(trim_to_input_cap(&mut messages, None), 0);
+        assert_eq!(messages.len(), 2);
+
+        // Big cap: no trim.
+        let mut messages: Vec<HistoryMessage> = vec![
+            HistoryMessage { role: "system".into(), content: "sys".into() },
+            HistoryMessage { role: "user".into(), content: "hi".into() },
+        ];
+        assert_eq!(trim_to_input_cap(&mut messages, Some(10_000)), 0);
+        assert_eq!(messages.len(), 2);
     }
 }
