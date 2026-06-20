@@ -30,7 +30,17 @@ pub struct BundledAssets {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstallEntry {
     pub id: String,
-    pub name: String,
+    /// Tool display name. Many upstream install JSONs only ship
+    /// `displayName` (without a bare `name`), so this field is
+    /// `Option<String>` with `#[serde(default)]` — `detect_one`
+    /// falls back to `display_name` when it's missing/empty.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Optional human-readable alias. When the JSON ships only
+    /// `displayName` (the common case in the public manifest),
+    /// `detect_one` uses this as the canonical `name`.
+    #[serde(default, rename = "displayName")]
+    pub display_name: Option<String>,
     #[serde(default)]
     pub category: Option<String>,
     #[serde(default)]

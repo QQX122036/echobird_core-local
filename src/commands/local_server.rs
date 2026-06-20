@@ -159,12 +159,21 @@ pub fn cancel_download() -> Result<(), String> {
 
 #[command]
 pub fn detect_gpu() -> Result<serde_json::Value, String> {
-    ipc(Ok(serde_json::json!({"available": false, "name": null, "vramGb": null})))
+    // Shape-compatible stub. The frontend types this as
+    // `{ gpuName: string, gpuVramGb: number } | null`. The previous
+    // shape (`{"available":false,"name":null,"vramGb":null}`) had
+    // the wrong field names and types — `info.gpuVramGb` was
+    // undefined so the LocalServer page's GPU VRAM logic silently
+    // used the 0-VRAM default. `null` is the correct "GPU not yet
+    // detected" sentinel so the page can fall through to
+    // `detect_gpu` to auto-probe.
+    ipc(Ok(serde_json::Value::Null))
 }
 
 #[command]
 pub fn get_gpu_info() -> Result<serde_json::Value, String> {
-    ipc(Ok(serde_json::json!({"available": false})))
+    // Shape-compatible stub — see detect_gpu above.
+    ipc(Ok(serde_json::Value::Null))
 }
 
 #[command]
@@ -176,7 +185,15 @@ pub fn install_local_engine() -> Result<(), String> {
 
 #[command]
 pub fn get_local_engine_status() -> Result<serde_json::Value, String> {
-    ipc(Ok(serde_json::json!({"installed": false, "version": null})))
+    // Shape-compatible stub. The frontend types this as
+    // `LocalEngineStatus { engines: LocalEngineEntry[] }` and
+    // LocalServer.tsx does `status.engines.find(...)` — accessing
+    // `.engines` on the old `{"installed":false,"version":null}`
+    // threw TypeError, was swallowed by the page's .catch, and
+    // left the engine status stuck on "checking" forever. The
+    // bare `engines: []` keeps the field present + the page
+    // routes to "not-installed" correctly.
+    ipc(Ok(serde_json::json!({"engines": []})))
 }
 
 #[command]

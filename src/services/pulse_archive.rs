@@ -13,6 +13,11 @@
 //!   UTC; we re-derive the local YYYY-MM-DD so a CST user
 //!   doesn't see every 00:00–08:00 item bucketed into the day
 //!   before).
+//! * `pulse_fetch(lang)` — walk the mirror chain for the given
+//!   language, pull the 7-day JSON window, fan it out to disk via
+//!   `pulse_save`, then return the merged view. The frontend calls
+//!   this on mount so the page no longer depends on a flaky
+//!   WebView-side `fetch` against an upstream CORS surface.
 //! * `pulse_load_all(lang)` — read every `*_{lang}.json` file in
 //!   the tree, dedupe by `item.url`, sort by `published_at`
 //!   descending.
@@ -37,6 +42,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 
 use chrono::{DateTime, Datelike, Local, Utc};
@@ -144,18 +150,50 @@ pub fn archive_root() -> PathBuf {
     }
 }
 
+/// Wrapper struct for legacy archive files written by the
+/// upstream EchoBird (and by the pre-pulse_fetch browser-side
+/// path in this fork). Those code paths serialised the bucket
+/// as `{"schema":1,"date":"...","lang":"...","items":[...]}`
+/// instead of a bare `Vec<PulseItem>` array. We accept both
+/// shapes so a user upgrading from an old build never has to
+/// hand-delete their archive.
+#[derive(Debug, serde::Deserialize)]
+struct LegacyBucket {
+    #[serde(default)]
+    items: Vec<PulseItem>,
+}
+
 /// Read a single bucket file. Missing file = empty list (we
 /// never want a 404-style error to bubble up; the frontend
 /// treats an empty archive as a normal "first launch" state).
+/// Tolerant of:
+///   * bare `[Item, ...]` arrays (current format)
+///   * `{"items":[...]}` legacy wrappers (upstream / browser-fetch)
+///   * corrupt / unparseable bytes (logged to stderr, treated as
+///     empty so a single bad file can't take down the whole
+///     archive read)
 fn read_bucket(path: &Path) -> CoreResult<Vec<PulseItem>> {
     match fs::read(path) {
         Ok(bytes) => {
             if bytes.is_empty() {
                 return Ok(Vec::new());
             }
-            serde_json::from_slice::<Vec<PulseItem>>(&bytes).map_err(|e| Error::Storage {
-                message: format!("parse {}: {e}", path.display()),
-            })
+            // Try bare array first.
+            if let Ok(items) = serde_json::from_slice::<Vec<PulseItem>>(&bytes) {
+                return Ok(items);
+            }
+            // Fall back to legacy `{"items":[...]}` wrapper.
+            if let Ok(legacy) = serde_json::from_slice::<LegacyBucket>(&bytes) {
+                return Ok(legacy.items);
+            }
+            // Otherwise: log to stderr and treat as empty. This
+            // is the "tolerant" fallback — we'd rather lose one
+            // bad bucket file than fail the whole archive walk.
+            eprintln!(
+                "[pulse_archive] could not parse {} as PulseItem array or legacy wrapper; skipping",
+                path.display()
+            );
+            Ok(Vec::new())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(Error::Storage {
@@ -338,6 +376,169 @@ pub fn load_all(lang_str: &str) -> CoreResult<Vec<PulseItem>> {
     Ok(all)
 }
 
+/// Mirror chains for the `pulse_fetch` command. Each list is walked
+/// in order on the Rust side so the WebView is no longer the one
+/// racing CORS / throttling on the upstream domain. We duplicate
+/// the per-lang ordering that lives in `src/pages/AiPulse/AiPulse.tsx`
+/// (PULSE_MIRRORS_ZH / PULSE_MIRRORS_EN) deliberately — these are
+/// public, well-known infrastructure endpoints and the cost of a
+/// one-line drift if someone reorders the chain is far smaller than
+/// the cost of sharing the config across the IPC boundary.
+const PULSE_MIRRORS_ZH: &[&str] = &[
+    "https://echobird.ai/pulse",
+    "https://ainew-1251534910.cos.ap-hongkong.myqcloud.com",
+    "https://suyxh.github.io/ai-news-aggregator/data",
+    "https://cdn.jsdelivr.net/gh/SuYxh/ai-news-aggregator@main/data",
+    "https://raw.githubusercontent.com/SuYxh/ai-news-aggregator/main/data",
+];
+const PULSE_MIRRORS_EN: &[&str] = &[
+    "https://echobird.ai/pulse",
+    "https://ainew-1251534910.cos.ap-hongkong.myqcloud.com",
+    "https://cdn.jsdelivr.net/gh/edison7009/EchoBird@main/docs/pulse",
+    "https://raw.githubusercontent.com/edison7009/EchoBird/main/docs/pulse",
+];
+const FEED_FILE_ZH: &str = "latest-7d.json";
+const FEED_FILE_EN: &str = "latest-7d-en.json";
+const MIRROR_TIMEOUT_SECS: u64 = 10;
+
+/// One mirror response. The shape matches the upstream extractor
+/// (see `docs/handoff/fix-ai-pulse-empty/README.md` §5). The header
+/// fields are kept for forward-compat even though the Rust side
+/// currently only uses `items`.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct PulseFeed {
+    generated_at: String,
+    #[serde(default)]
+    window_hours: u32,
+    #[serde(default)]
+    total_items: u32,
+    items: Vec<PulseItem>,
+}
+
+/// Pick the mirror chain + filename for a given archive language.
+fn mirrors_for(lang: Lang) -> (&'static [&'static str], &'static str) {
+    match lang {
+        Lang::Zh => (PULSE_MIRRORS_ZH, FEED_FILE_ZH),
+        Lang::En => (PULSE_MIRRORS_EN, FEED_FILE_EN),
+    }
+}
+
+/// True if the response body looks like an HTML error page rather
+/// than a JSON payload. Several of the upstream surfaces
+/// (notably Cloudflare 5xx and a few of the GitHub raw redirects)
+/// return a styled HTML doc with a 200 — we treat that as failure
+/// and advance to the next mirror.
+fn looks_like_html(s: &str) -> bool {
+    let head: String = s.chars().take(200).collect::<String>().trim_start().to_lowercase();
+    head.starts_with("<!doctype html") || head.starts_with("<html")
+}
+
+/// Walk the mirror chain, return the first body whose HTTP status
+/// is 2xx and whose body parses as [`PulseFeed`]. Errors are
+/// surfaced verbatim (the command layer prefixes them with the
+/// standard `network:` / `upstream:` / `timeout:` code).
+async fn fetch_from_mirrors(
+    client: &reqwest::Client,
+    mirrors: &[&str],
+    file: &str,
+) -> CoreResult<PulseFeed> {
+    let mut last_err: Option<Error> = None;
+    for base in mirrors {
+        let url = format!("{base}/{file}");
+        let res = client.get(&url).send().await;
+        match res {
+            Ok(r) => {
+                let status = r.status();
+                if !status.is_success() {
+                    last_err = Some(Error::upstream(format!(
+                        "{base} {status}"
+                    )));
+                    continue;
+                }
+                let text = r.text().await.map_err(|e| {
+                    Error::network(format!("{base} read body: {e}"))
+                })?;
+                if looks_like_html(&text) {
+                    last_err = Some(Error::upstream(format!(
+                        "{base} returned HTML"
+                    )));
+                    continue;
+                }
+                match serde_json::from_str::<PulseFeed>(&text) {
+                    Ok(feed) => return Ok(feed),
+                    Err(e) => {
+                        last_err = Some(Error::upstream(format!(
+                            "{base} bad JSON: {e}"
+                        )));
+                        continue;
+                    }
+                }
+            }
+            Err(e) if e.is_timeout() => {
+                last_err = Some(Error::timeout(format!("{base} > {MIRROR_TIMEOUT_SECS}s")));
+                continue;
+            }
+            Err(e) => {
+                last_err = Some(Error::network(format!("{base}: {e}")));
+                continue;
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| Error::network("all mirrors failed")))
+}
+
+/// `pulse_fetch` — pull the 7-day window from the mirror chain and
+/// fan it out into the on-disk archive. After the persist step we
+/// run `load_all` so the in-memory view the frontend gets back is
+/// the deduped union of (already-on-disk) + (just-fetched). The
+/// frontend treats both fields as the "current items" payload and
+/// reconciles them with whatever it already had in browser state.
+///
+/// Network failures are non-fatal: `pulse_fetch` returns the
+/// existing on-disk items alongside an `error` string so the
+/// frontend can surface a "fetch failed, showing cached" banner
+/// instead of an empty page.
+pub async fn fetch_and_persist(
+    lang_str: &str,
+) -> CoreResult<(Vec<PulseItem>, Option<String>)> {
+    let lang = Lang::parse(lang_str)?;
+    let (mirrors, file) = mirrors_for(lang);
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(MIRROR_TIMEOUT_SECS))
+        .user_agent(concat!("EchoBird/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| Error::network(format!("build reqwest client: {e}")))?;
+
+    let fetch_res = fetch_from_mirrors(&client, mirrors, file).await;
+    let merged = load_all(lang_str)?;
+
+    match fetch_res {
+        Ok(feed) => {
+            if !feed.items.is_empty() {
+                save(lang_str, &feed.items)?;
+                // Re-load so the returned list reflects the just-persisted
+                // items plus everything that was already on disk.
+                let merged = load_all(lang_str)?;
+                return Ok((merged, None));
+            }
+            // Empty payload from a 2xx mirror is unusual but
+            // non-fatal: return the existing archive with a
+            // diagnostic so the UI can show "no new items".
+            Ok((
+                merged,
+                Some(format!("{} returned 0 items", mirrors[0])),
+            ))
+        }
+        Err(e) => {
+            // Network/upstream failure: keep the archive intact
+            // and surface the error to the frontend.
+            Ok((merged, Some(e.to_string())))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +643,57 @@ mod tests {
         // implementation also silently drops these.
         let written = save("en", &items).expect("save with broken item");
         assert!(written.is_empty(), "no bucket should be written for an item with no timestamp");
+    }
+
+    #[test]
+    fn read_bucket_accepts_legacy_wrapper_format() {
+        // The upstream EchoBird (and our pre-pulse_fetch browser
+        // path) wrote each bucket as a JSON object with an
+        // `items` field, not a bare array. read_bucket must
+        // accept that shape so users upgrading from an old
+        // build keep their history. This test is fully isolated:
+        // it writes a custom file to a tempdir and calls
+        // read_bucket directly, so it doesn't share state with
+        // the roundtrip tests (which use ECHOBIRD_PULSE_DIR).
+        let tmp = std::env::temp_dir().join(format!(
+            "echobird-pulse-legacy-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let bucket = tmp.join("2026/06/12_zh.json");
+        std::fs::create_dir_all(bucket.parent().unwrap()).unwrap();
+        let legacy = serde_json::json!({
+            "schema": 1,
+            "date": "2026-06-12",
+            "lang": "zh",
+            "item_count": 2,
+            "items": [
+                make_item("legacy-a", "https://legacy.test/a", "2026-06-12T10:00:00Z"),
+                make_item("legacy-b", "https://legacy.test/b", "2026-06-12T12:00:00Z"),
+            ]
+        });
+        std::fs::write(&bucket, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let items = read_bucket(&bucket).expect("read_bucket should tolerate legacy format");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].url, "https://legacy.test/a");
+    }
+
+    #[test]
+    fn read_bucket_skips_unparseable_files_instead_of_erroring() {
+        // A file that isn't valid JSON for either shape should
+        // not bring down the whole archive walk — the loader
+        // logs to stderr and returns an empty list for that
+        // bucket. Fully isolated (no env-var mutation).
+        let tmp = std::env::temp_dir().join(format!(
+            "echobird-pulse-corrupt-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let bucket = tmp.join("2026/06/13_zh.json");
+        std::fs::create_dir_all(bucket.parent().unwrap()).unwrap();
+        std::fs::write(&bucket, b"this is not json").unwrap();
+        let items = read_bucket(&bucket).expect("read_bucket must not error on bad JSON");
+        assert!(items.is_empty(), "bad bucket should be treated as empty");
     }
 
     #[test]

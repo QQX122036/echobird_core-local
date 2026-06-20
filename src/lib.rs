@@ -107,6 +107,10 @@ pub fn run(context: Context<tauri::Wry>, _tray_icon_bytes: &'static [u8]) {
             commands::ai_career::ai_career_family_history,
             commands::ai_career::ai_career_token_bytes,
             commands::ai_career::get_mother_hints,
+            // ─── AI Pulse (news + star projects) ─────────
+            commands::pulse::pulse_save,
+            commands::pulse::pulse_load_all,
+            commands::pulse::pulse_fetch,
         ])
         .setup(|app| {
             // Open the SQLite store. We resolve the app's data
