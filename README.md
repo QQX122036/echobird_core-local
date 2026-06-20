@@ -148,3 +148,32 @@ against this crate directly.
 
 BUSL-1.1, matching the upstream project. See `LICENSE` for the
 full text.
+
+## v5.3.4 contract: `AgentSendInput.history`
+
+Starting with the public frontend `v5.3.4` (HEAD `744657b0` of
+`QQX122036/EchoBird`), the Mother Agent threads the chat history
+through to the backend via an optional `history: Vec<HistoryMessage>`
+field on `AgentSendInput`. The backend:
+
+- Treats the first `history` entry as the system prompt and never
+  evicts it. (When the caller passes an empty history, the
+  backend falls back to the single-turn behavior — no trim, no
+  system-prompt recovery. This matches the pre-5.3.4 contract.)
+- Trims oldest non-system messages to fit `maxInputTokens` (5%
+  safety margin). The current user turn is appended after the
+  trim and is never dropped.
+- Builds the upstream OpenAI-shaped `messages` array from the
+  *trimmed* list, not the original one. The trim is not advisory.
+
+For the SSE response side, `parse_sse_payload` dispatches on the
+protocol flag (`use_anthropic`) to the right shape matcher. Both
+the OpenAI Chat Completions and Responses API envelopes are
+recognized; the Anthropic Messages API envelope handles text
+deltas, tool-use start, and tool-call arg streaming.
+
+Backwards compatibility: the `history` field is `#[serde(default)]`
+on the Rust side and `?:` in the TypeScript interface, so any
+frontend built against the pre-5.3.4 contract continues to work
+unchanged. The backend treats an absent `history` as a single-turn
+message and applies no trim.
