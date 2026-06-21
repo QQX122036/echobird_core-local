@@ -57,7 +57,7 @@ impl AsRef<str> for HistoryMessage {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct AgentSendInput {
     pub message: String,
     pub model_id: String,
@@ -105,6 +105,16 @@ pub async fn send_message<R: Runtime>(
     store: &Arc<dyn Store>,
     input: AgentSendInput,
 ) -> CoreResult<AgentEvent> {
+    // Diagnostic: log the start of every send. Helps diagnose
+    // "stuck at thinking" cases where the IPC call never
+    // appears to return.
+    log::info!(
+        "agent: send_message start — model_id={} base_url={} use_anthropic={} message_len={}",
+        input.model_id,
+        input.base_url,
+        input.anthropic_url.is_some(),
+        input.message.len(),
+    );
     // Resolve the saved model (if any) for its token caps. If
     // the caller passed an ad-hoc baseUrl that doesn't match a
     // saved model, we skip the cap and the UI shows a hint.
@@ -142,18 +152,41 @@ pub async fn send_message<R: Runtime>(
     // Anthropic first and falls back to OpenAI on 400; the
     // clean-room build dispatches on the URL alone and never
     // mid-flight switches (matches v5.2.0+ behavior).
+    //
+    // The configured `base_url` / `anthropic_url` are *base*
+    // URLs (e.g. `https://api.example.com/v1` or
+    // `https://api.example.com/anthropic`). The upstream
+    // request path differs by protocol:
+    //   * OpenAI Chat Completions → `{base_url}/chat/completions`
+    //   * Anthropic Messages      → `{anthropic_url}/v1/messages`
+    //
+    // If the configured URL already includes the full path
+    // (e.g. user pasted `.../v1/chat/completions` directly), we
+    // use it as-is and don't double-append. This matches the
+    // upstream's own behaviour and avoids the previous bug
+    // where POSTing to a bare base URL returned 404 ("404
+    // page not found" from the upstream's catch-all router).
     let use_anthropic = input
         .anthropic_url
         .as_deref()
         .map(|u| u.contains("anthropic") || u.contains("/v1/messages"))
         .unwrap_or(false);
+    let base_url = input.base_url.trim_end_matches('/').to_string();
+    let anthropic_base = input
+        .anthropic_url
+        .as_deref()
+        .map(|u| u.trim_end_matches('/').to_string());
     let url = if use_anthropic {
-        input
-            .anthropic_url
-            .clone()
-            .unwrap_or_else(|| input.base_url.clone())
+        let a = anthropic_base.unwrap_or_else(|| base_url.clone());
+        if a.ends_with("/v1/messages") {
+            a
+        } else {
+            format!("{}/v1/messages", a)
+        }
+    } else if base_url.ends_with("/chat/completions") {
+        base_url
     } else {
-        input.base_url.clone()
+        format!("{}/chat/completions", base_url)
     };
 
     // Clamp the per-request `max_tokens` to the configured
@@ -174,19 +207,54 @@ pub async fn send_message<R: Runtime>(
         .map(|m| json!({"role": m.role, "content": m.content}))
         .collect();
 
-    let body = json!({
-        "model": input.model_id,
-        "messages": openai_messages,
-        "max_tokens": max_tokens,
-        "stream": true,
-    });
-
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
         .map_err(|e| Error::network(e.to_string()))?;
-    let req = client.post(&url).bearer_auth(&input.api_key).json(&body);
-    let resp = req.send().await?;
+
+    // Body + auth header differ by protocol. The clean-room
+    // build dispatches on the URL alone (no mid-flight
+    // fallback) so the right shape goes out the door the
+    // first time.
+    //
+    //   * OpenAI:  Authorization: Bearer <key>
+    //              body = {model, messages, max_tokens, stream}
+    //   * Anthropic: x-api-key: <key>, anthropic-version: 2023-06-01
+    //              body = {model, system?, messages, max_tokens, stream}
+    //              (system prompt is the first history entry
+    //               with role="system"; otherwise omitted)
+    let (body, req_builder) = if use_anthropic {
+        let system_prompt = messages
+            .iter()
+            .find(|m| m.role == "system")
+            .map(|m| m.content.clone());
+        let mut b = json!({
+            "model": input.model_id,
+            "messages": openai_messages,
+            "max_tokens": max_tokens,
+            "stream": true,
+        });
+        if let Some(sys) = system_prompt {
+            b["system"] = json!(sys);
+        }
+        let builder = client
+            .post(&url)
+            .header("x-api-key", &input.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&b);
+        (b, builder)
+    } else {
+        let b = json!({
+            "model": input.model_id,
+            "messages": openai_messages,
+            "max_tokens": max_tokens,
+            "stream": true,
+        });
+        let builder = client.post(&url).bearer_auth(&input.api_key).json(&b);
+        (b, builder)
+    };
+    let _ = body; // suppress unused warning; body was moved into builder
+    let resp = req_builder.send().await?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -217,7 +285,8 @@ pub async fn send_message<R: Runtime>(
     let mut final_event = AgentEvent::Done;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| Error::network(e.to_string()))?;
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        let s = String::from_utf8_lossy(&chunk);
+        buffer.push_str(&s);
         while let Some((event, rest)) = split_sse_event(&buffer) {
             buffer = rest.to_string();
             if let Some(parsed) = parse_sse_payload(&event, use_anthropic) {
@@ -228,6 +297,14 @@ pub async fn send_message<R: Runtime>(
             }
         }
     }
+    log::info!(
+        "agent: send_message done — events={} final={:?}",
+        if matches!(final_event, AgentEvent::Error { .. }) { "error" } else { "ok" },
+        match &final_event {
+            AgentEvent::Error { message } => message.as_str(),
+            _ => "ok",
+        }
+    );
     let _ = app.emit("agent-event", AgentEvent::Done);
     Ok(final_event)
 }

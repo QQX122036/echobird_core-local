@@ -51,3 +51,8 @@ hex = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+# Allow integration tests to spin up a Tauri app with `mock_app()`
+# (from `tauri::test`) so we can assert that the real
+# `services::agent::send_message` actually emits on the
+# `agent-event` channel in the same way the running app does.
+tauri = { version = "2", features = ["test"] }
